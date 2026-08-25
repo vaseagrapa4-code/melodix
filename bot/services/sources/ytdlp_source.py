@@ -95,6 +95,7 @@ class _YtDlpBase(MusicSource):
         opts = _with_cookies({
             "quiet": True,
             "no_warnings": True,
+            "noprogress": True,
             "format": "bestaudio/best",
             "outtmpl": out_template,
             "noplaylist": True,
@@ -139,6 +140,7 @@ class _YtDlpBase(MusicSource):
         opts = _with_cookies({
             "quiet": True,
             "no_warnings": True,
+            "noprogress": True,
             "format": "bestaudio/best",
             "outtmpl": out_template,
             "noplaylist": True,
@@ -195,6 +197,7 @@ class YouTubeSource(_YtDlpBase):
         opts = _with_cookies({
             "quiet": True,
             "no_warnings": True,
+            "noprogress": True,
             "extract_flat": True,
             "noplaylist": True,
             "skip_download": True,
@@ -225,6 +228,7 @@ class YTMusicSource(_YtDlpBase):
         opts = _with_cookies({
             "quiet": True,
             "no_warnings": True,
+            "noprogress": True,
             "extract_flat": True,
             "noplaylist": True,
             "skip_download": True,
@@ -267,6 +271,7 @@ class SoundCloudSource(_YtDlpBase):
         opts = {
             "quiet": True,
             "no_warnings": True,
+            "noprogress": True,
             "extract_flat": True,
             "noplaylist": True,
             "skip_download": True,
@@ -306,6 +311,7 @@ class SoundCloudSource(_YtDlpBase):
         opts = {
             "quiet": True,
             "no_warnings": True,
+            "noprogress": True,
             "format": "bestaudio/best",
             "outtmpl": out_template,
             "noplaylist": True,

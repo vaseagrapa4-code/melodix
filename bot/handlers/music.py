@@ -281,7 +281,9 @@ async def on_lyrics(
     await callback.answer(translator.get(lang, "lyrics_loading"))
     title = track.get("title", "")
     artist = track.get("artist", "")
-    lyrics = await get_lyrics(artist, title)
+    # `artist` may actually be the uploader (esp. SoundCloud); the lyrics
+    # service tries several combinations to find a match.
+    lyrics = await get_lyrics(artist, title, uploader=artist)
     if not lyrics:
         await callback.message.answer(translator.get(lang, "lyrics_not_found"))
         return
@@ -312,7 +314,16 @@ async def on_more_from_artist(
         await callback.answer(translator.get(lang, "generic_error"), show_alert=True)
         return
 
-    artist = track.get("artist", "")
+    # Recover a clean artist name (the stored `artist` may be an uploader
+    # or embedded inside the title, e.g. "Buddy Holly - Weezer").
+    from bot.utils.metadata import best_artist_name
+
+    artist = best_artist_name(
+        track.get("title", ""), track.get("artist", ""), track.get("artist", "")
+    )
+    if not artist:
+        await callback.message.answer(translator.get(lang, "more_artist_none"))
+        return
     await callback.answer(translator.get(lang, "more_artist_loading", artist=artist))
     results = await music.more_from_artist(artist, config.max_search_results)
     if not results:
