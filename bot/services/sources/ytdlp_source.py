@@ -16,7 +16,10 @@ search URL and the results are filtered to real playable tracks.
 """
 
 import asyncio
+import base64
 import logging
+import os
+import tempfile
 import urllib.parse
 from pathlib import Path
 
@@ -25,6 +28,56 @@ import yt_dlp
 from .base import MusicSource, Track
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+#  Cookies support (needed on cloud servers).
+#  YouTube blocks data-center IPs with "Sign in to confirm you're not a bot".
+#  Passing cookies from a logged-in browser session fixes this.
+#
+#  Two ways to provide cookies (checked in this order):
+#    1. YT_COOKIES_B64  -> the whole cookies.txt, base64-encoded (best for
+#                          Render/cloud: paste it as one env var).
+#    2. COOKIES_FILE    -> a path to a cookies.txt file on disk.
+# ---------------------------------------------------------------------------
+_COOKIES_FILE_ENV = os.getenv("COOKIES_FILE", "cookies.txt")
+_COOKIES_B64_ENV = "YT_COOKIES_B64"
+_cookies_path_cache: str | None = None
+
+
+def _get_cookies_file() -> str | None:
+    """Return a path to a cookies.txt, materializing it from base64 if needed."""
+    global _cookies_path_cache
+    if _cookies_path_cache and Path(_cookies_path_cache).exists():
+        return _cookies_path_cache
+
+    # 1) Base64 env var (best for cloud hosts).
+    b64 = os.getenv(_COOKIES_B64_ENV)
+    if b64:
+        try:
+            data = base64.b64decode(b64)
+            tmp = Path(tempfile.gettempdir()) / "yt_cookies.txt"
+            tmp.write_bytes(data)
+            _cookies_path_cache = str(tmp)
+            logger.info("Loaded YouTube cookies from %s", _COOKIES_B64_ENV)
+            return _cookies_path_cache
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not decode %s: %s", _COOKIES_B64_ENV, exc)
+
+    # 2) A cookies file on disk.
+    if _COOKIES_FILE_ENV and Path(_COOKIES_FILE_ENV).exists():
+        _cookies_path_cache = _COOKIES_FILE_ENV
+        return _cookies_path_cache
+
+    return None
+
+
+def _with_cookies(opts: dict) -> dict:
+    """Add the cookiefile option to a yt-dlp options dict, if cookies exist."""
+    cookies = _get_cookies_file()
+    if cookies:
+        opts["cookiefile"] = cookies
+    return opts
 
 
 class _YtDlpBase(MusicSource):
@@ -39,7 +92,7 @@ class _YtDlpBase(MusicSource):
             url = f"https://www.youtube.com/watch?v={track.id}"
 
         out_template = str(dest_dir / "%(id)s.%(ext)s")
-        opts = {
+        opts = _with_cookies({
             "quiet": True,
             "no_warnings": True,
             "format": "bestaudio/best",
@@ -52,7 +105,7 @@ class _YtDlpBase(MusicSource):
                     "preferredquality": "192",
                 }
             ],
-        }
+        })
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
@@ -101,13 +154,13 @@ class YouTubeSource(_YtDlpBase):
         return await asyncio.to_thread(self._search_sync, query, limit)
 
     def _search_sync(self, query: str, limit: int) -> list[Track]:
-        opts = {
+        opts = _with_cookies({
             "quiet": True,
             "no_warnings": True,
             "extract_flat": True,
             "noplaylist": True,
             "skip_download": True,
-        }
+        })
         tracks: list[Track] = []
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
@@ -131,7 +184,7 @@ class YTMusicSource(_YtDlpBase):
     def _search_sync(self, query: str, limit: int) -> list[Track]:
         q = urllib.parse.quote(query)
         url = f"https://music.youtube.com/search?q={q}"
-        opts = {
+        opts = _with_cookies({
             "quiet": True,
             "no_warnings": True,
             "extract_flat": True,
@@ -139,7 +192,7 @@ class YTMusicSource(_YtDlpBase):
             "skip_download": True,
             # Keep the request small; we filter to tracks afterwards.
             "playlist_items": f"1-{max(limit * 3, 15)}",
-        }
+        })
         tracks: list[Track] = []
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
