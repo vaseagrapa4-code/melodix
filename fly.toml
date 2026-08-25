@@ -1,0 +1,23 @@
+# Fly.io configuration for the Melodix Telegram bot.
+# Long-polling bot -> runs as an always-on worker (no web server), with a
+# PERSISTENT volume at /data so the playlists database survives restarts.
+
+app = "user-peaceful-lagoon-340"
+primary_region = "fra"
+
+[build]
+  dockerfile = "Dockerfile"
+
+# Persistent storage for the SQLite database (playlists, languages, stats).
+[mounts]
+  source = "melodix_data"
+  destination = "/data"
+
+[env]
+  DATABASE_PATH = "/data/bot.db"
+  DOWNLOAD_DIR = "/tmp/downloads"
+
+# One always-on machine. A long-polling bot must never be auto-stopped.
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

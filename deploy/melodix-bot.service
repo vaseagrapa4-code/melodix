@@ -1,0 +1,29 @@
+# systemd service that keeps the bot running 24/7 and restarts it if it crashes
+# or if the server reboots. Copy this to /etc/systemd/system/melodix-bot.service
+#
+# IMPORTANT: adjust the two paths below if you put the project somewhere else.
+#   WorkingDirectory = the folder that contains the "bot" package
+#   ExecStart        = the venv python + "-m bot.main"
+
+[Unit]
+Description=Melodix Telegram Music Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Run as the "ubuntu" user (default on Oracle Ubuntu images). Change if needed.
+User=ubuntu
+WorkingDirectory=/home/ubuntu/telegram-music-bot
+ExecStart=/home/ubuntu/telegram-music-bot/.venv/bin/python -m bot.main
+
+# Restart automatically on crash, and always after a reboot.
+Restart=always
+RestartSec=5
+
+# Keep logs in the system journal (view with: journalctl -u melodix-bot -f).
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+# Flexible version ranges so pip installs prebuilt wheels for your Python
+# version (including Python 3.13/3.14) instead of compiling from source.
+aiogram>=3.15
+python-dotenv>=1.0.1
+yt-dlp>=2025.1.15
+mutagen>=1.47.0
+aiohttp>=3.9
+
+# PostgreSQL driver — used only when DATABASE_URL is set (e.g. free Neon DB).
+# The bot still works with plain SQLite if you don't set DATABASE_URL.
+asyncpg>=0.29

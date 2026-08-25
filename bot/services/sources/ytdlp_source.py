@@ -1,0 +1,158 @@
+"""
+Music sources powered by yt-dlp.
+
+yt-dlp can search YouTube with a plain text query, which naturally handles
+searches by song title, artist name, OR a snippet of the lyrics (YouTube's
+search indexes lyric text). It then downloads the best audio stream and
+converts it to mp3 via ffmpeg.
+
+We expose two logical sources so that if one is throttled the bot automatically
+tries the other:
+  * YouTubeSource  -> regular YouTube search  (ytsearch)
+  * YTMusicSource  -> YouTube Music search    (music.youtube.com/search URL)
+
+Note: yt-dlp has NO "ytmsearch" prefix, so YouTube Music is queried through its
+search URL and the results are filtered to real playable tracks.
+"""
+
+import asyncio
+import logging
+import urllib.parse
+from pathlib import Path
+
+import yt_dlp
+
+from .base import MusicSource, Track
+
+logger = logging.getLogger(__name__)
+
+
+class _YtDlpBase(MusicSource):
+    """Shared download logic for the YouTube-family sources."""
+
+    async def download(self, track: Track, dest_dir: Path) -> Path | None:
+        return await asyncio.to_thread(self._download_sync, track, dest_dir)
+
+    def _download_sync(self, track: Track, dest_dir: Path) -> Path | None:
+        url = track.id
+        if not url.startswith("http"):
+            url = f"https://www.youtube.com/watch?v={track.id}"
+
+        out_template = str(dest_dir / "%(id)s.%(ext)s")
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "format": "bestaudio/best",
+            "outtmpl": out_template,
+            "noplaylist": True,
+            "postprocessors": [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }
+            ],
+        }
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+        except Exception as exc:  # noqa: BLE001 - handled as "no file"
+            logger.warning("[%s] download failed for %s: %s", self.name, url, exc)
+            return None
+        video_id = info.get("id")
+        result = dest_dir / f"{video_id}.mp3"
+        if result.exists():
+            logger.info("[%s] downloaded %s", self.name, result.name)
+            return result
+        logger.error("[%s] download produced no file for %s", self.name, url)
+        return None
+
+    @staticmethod
+    def _to_track(entry: dict, source_name: str) -> Track | None:
+        """Convert a yt-dlp flat entry into a Track, skipping non-tracks."""
+        if not entry:
+            return None
+        url = entry.get("url") or entry.get("id", "")
+        title = entry.get("title")
+        # Skip entries that are not playable songs (channels, playlists, etc.).
+        if not title or "/watch" not in (url if url.startswith("http") else "/watch"):
+            # For plain video ids (regular ytsearch) there is no '/watch' in the
+            # url, so only apply the watch filter to full URLs.
+            if url.startswith("http") and "/watch" not in url:
+                return None
+        if not title:
+            return None
+        return Track(
+            source=source_name,
+            id=url,
+            title=title,
+            artist=entry.get("uploader") or entry.get("channel") or "",
+            duration=int(entry.get("duration") or 0),
+            views=int(entry.get("view_count") or 0),
+        )
+
+
+class YouTubeSource(_YtDlpBase):
+    """Regular YouTube search via the ytsearch prefix."""
+
+    name = "youtube"
+
+    async def search(self, query: str, limit: int) -> list[Track]:
+        return await asyncio.to_thread(self._search_sync, query, limit)
+
+    def _search_sync(self, query: str, limit: int) -> list[Track]:
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": True,
+            "noplaylist": True,
+            "skip_download": True,
+        }
+        tracks: list[Track] = []
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
+            for entry in (info or {}).get("entries", []) or []:
+                t = self._to_track(entry, self.name)
+                if t:
+                    tracks.append(t)
+        tracks.sort(key=lambda t: t.views, reverse=True)
+        logger.info("[%s] '%s' -> %d results", self.name, query, len(tracks))
+        return tracks
+
+
+class YTMusicSource(_YtDlpBase):
+    """YouTube Music search via the music.youtube.com search URL."""
+
+    name = "ytmusic"
+
+    async def search(self, query: str, limit: int) -> list[Track]:
+        return await asyncio.to_thread(self._search_sync, query, limit)
+
+    def _search_sync(self, query: str, limit: int) -> list[Track]:
+        q = urllib.parse.quote(query)
+        url = f"https://music.youtube.com/search?q={q}"
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": True,
+            "noplaylist": True,
+            "skip_download": True,
+            # Keep the request small; we filter to tracks afterwards.
+            "playlist_items": f"1-{max(limit * 3, 15)}",
+        }
+        tracks: list[Track] = []
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+        except Exception as exc:  # noqa: BLE001 - let MusicService try next source
+            logger.warning("[ytmusic] search failed: %s", exc)
+            return []
+
+        for entry in (info or {}).get("entries", []) or []:
+            t = self._to_track(entry, self.name)
+            if t:
+                tracks.append(t)
+            if len(tracks) >= limit:
+                break
+        logger.info("[%s] '%s' -> %d results", self.name, query, len(tracks))
+        return tracks

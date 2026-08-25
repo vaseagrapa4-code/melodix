@@ -1,0 +1,21 @@
+# Render.com configuration (free tier friendly).
+#
+# The bot uses long-polling, so we run it as a Web Service with a tiny
+# keep-alive HTTP server (see bot/utils/keepalive.py). Render provides the PORT
+# env var automatically, which switches the keep-alive server on.
+#
+# IMPORTANT: after the first deploy, set an external pinger (e.g. UptimeRobot)
+# to hit the service URL every ~10 minutes so the free instance doesn't sleep.
+
+services:
+  - type: web
+    name: melodix-bot
+    env: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        sync: false          # set this in the Render dashboard (secret)
+      - key: DATABASE_URL
+        sync: false          # your Neon connection string (secret)
