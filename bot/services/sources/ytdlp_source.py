@@ -98,6 +98,51 @@ class _YtDlpBase(MusicSource):
             "format": "bestaudio/best",
             "outtmpl": out_template,
             "noplaylist": True,
+            # Use alternative YouTube player clients. This avoids the newer
+            # "The page needs to be reloaded" / bot-check errors that hit the
+            # default web client on servers. yt-dlp will try them in order.
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["android", "ios", "web_safari", "tv"],
+                }
+            },
+            "postprocessors": [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }
+            ],
+        })
+        # Try the download; if it still fails, retry once WITHOUT cookies using
+        # the android client, which often works even when the web client is
+        # blocked.
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+        except Exception as exc:  # noqa: BLE001 - handled as "no file" / retry
+            logger.warning("[%s] download failed for %s: %s", self.name, url, exc)
+            info = self._retry_android_only(url, dest_dir)
+            if info is None:
+                return None
+        video_id = info.get("id")
+        result = dest_dir / f"{video_id}.mp3"
+        if result.exists():
+            logger.info("[%s] downloaded %s", self.name, result.name)
+            return result
+        logger.error("[%s] download produced no file for %s", self.name, url)
+        return None
+
+    def _retry_android_only(self, url: str, dest_dir: Path):
+        """Last-resort retry using only the android player client."""
+        out_template = str(dest_dir / "%(id)s.%(ext)s")
+        opts = _with_cookies({
+            "quiet": True,
+            "no_warnings": True,
+            "format": "bestaudio/best",
+            "outtmpl": out_template,
+            "noplaylist": True,
+            "extractor_args": {"youtube": {"player_client": ["android"]}},
             "postprocessors": [
                 {
                     "key": "FFmpegExtractAudio",
@@ -108,17 +153,10 @@ class _YtDlpBase(MusicSource):
         })
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-        except Exception as exc:  # noqa: BLE001 - handled as "no file"
-            logger.warning("[%s] download failed for %s: %s", self.name, url, exc)
+                return ydl.extract_info(url, download=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[%s] android retry failed for %s: %s", self.name, url, exc)
             return None
-        video_id = info.get("id")
-        result = dest_dir / f"{video_id}.mp3"
-        if result.exists():
-            logger.info("[%s] downloaded %s", self.name, result.name)
-            return result
-        logger.error("[%s] download produced no file for %s", self.name, url)
-        return None
 
     @staticmethod
     def _to_track(entry: dict, source_name: str) -> Track | None:
