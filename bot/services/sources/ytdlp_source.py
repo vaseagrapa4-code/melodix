@@ -80,6 +80,49 @@ def _with_cookies(opts: dict) -> dict:
     return opts
 
 
+# Extensions Telegram plays natively as audio -> no conversion needed.
+_PLAYABLE_EXTS = {".mp3", ".m4a", ".aac"}
+
+
+def _ensure_playable(path: Path) -> Path:
+    """
+    Make sure the audio file is in a Telegram-friendly format.
+
+    If it's already mp3/m4a/aac we return it untouched (NO re-encoding — fast).
+    Only webm/opus/ogg get converted to m4a (fast copy of the AAC/Opus stream
+    into an m4a container when possible, else a light re-encode).
+    """
+    import subprocess
+
+    if path.suffix.lower() in _PLAYABLE_EXTS:
+        return path
+
+    out = path.with_suffix(".m4a")
+    # First try a stream COPY (no re-encode) — instant. Works if the source is
+    # already AAC. If it fails (e.g. Opus), fall back to a light AAC re-encode.
+    for args in (
+        ["-c:a", "copy"],
+        ["-c:a", "aac", "-b:a", "192k"],
+    ):
+        try:
+            proc = subprocess.run(
+                ["ffmpeg", "-y", "-i", str(path), *args, str(out)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=120,
+            )
+            if proc.returncode == 0 and out.exists() and out.stat().st_size > 0:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return out
+        except Exception:  # noqa: BLE001
+            continue
+    # Conversion failed; return the original file and hope Telegram accepts it.
+    return path
+
+
 class _YtDlpBase(MusicSource):
     """Shared download logic for the YouTube-family sources."""
 
@@ -96,28 +139,22 @@ class _YtDlpBase(MusicSource):
             "quiet": True,
             "no_warnings": True,
             "noprogress": True,
-            "format": "bestaudio/best",
+            # Prefer already-compressed audio (m4a/mp3). We do NOT add an
+            # ffmpeg postprocessor here — if the file is already m4a/mp3/aac
+            # (the common case) we send it as-is with ZERO re-encoding, which
+            # is the biggest speed win on slow cloud CPUs. Only webm/opus get
+            # converted afterwards by _ensure_playable().
+            "format": "bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio/best",
             "outtmpl": out_template,
             "noplaylist": True,
-            # Use alternative YouTube player clients. This avoids the newer
-            # "The page needs to be reloaded" / bot-check errors that hit the
-            # default web client on servers. yt-dlp will try them in order.
+            # Abort early if the audio is larger than the send limit (~50 MB).
+            "max_filesize": 50 * 1024 * 1024,
             "extractor_args": {
                 "youtube": {
                     "player_client": ["android", "ios", "web_safari", "tv"],
                 }
             },
-            "postprocessors": [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192",
-                }
-            ],
         })
-        # Try the download; if it still fails, retry once WITHOUT cookies using
-        # the android client, which often works even when the web client is
-        # blocked.
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
@@ -126,12 +163,25 @@ class _YtDlpBase(MusicSource):
             info = self._retry_android_only(url, dest_dir)
             if info is None:
                 return None
-        video_id = info.get("id")
-        result = dest_dir / f"{video_id}.mp3"
-        if result.exists():
-            logger.info("[%s] downloaded %s", self.name, result.name)
-            return result
-        logger.error("[%s] download produced no file for %s", self.name, url)
+        path = self._find_output(info, dest_dir)
+        return _ensure_playable(path) if path else None
+
+    @staticmethod
+    def _find_output(info: dict, dest_dir: Path) -> Path | None:
+        """Locate the audio file yt-dlp produced (mp3/m4a/etc.)."""
+        video_id = (info or {}).get("id")
+        if not video_id:
+            return None
+        # Prefer mp3, then any audio file with this id.
+        mp3 = dest_dir / f"{video_id}.mp3"
+        if mp3.exists():
+            return mp3
+        for ext in ("m4a", "webm", "opus", "aac", "ogg"):
+            cand = dest_dir / f"{video_id}.{ext}"
+            if cand.exists():
+                return cand
+        for cand in dest_dir.glob(f"{video_id}.*"):
+            return cand
         return None
 
     def _retry_android_only(self, url: str, dest_dir: Path):
@@ -141,17 +191,11 @@ class _YtDlpBase(MusicSource):
             "quiet": True,
             "no_warnings": True,
             "noprogress": True,
-            "format": "bestaudio/best",
+            "format": "bestaudio[ext=m4a]/bestaudio/best",
             "outtmpl": out_template,
             "noplaylist": True,
+            "max_filesize": 50 * 1024 * 1024,
             "extractor_args": {"youtube": {"player_client": ["android"]}},
-            "postprocessors": [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192",
-                }
-            ],
         })
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
@@ -307,21 +351,16 @@ class SoundCloudSource(_YtDlpBase):
 
     def _download_sync(self, track: Track, dest_dir: Path) -> Path | None:
         # SoundCloud needs no cookies / player_client tricks — simple download.
+        # No forced re-encode: take the native audio and only fix it if needed.
         out_template = str(dest_dir / "%(id)s.%(ext)s")
         opts = {
             "quiet": True,
             "no_warnings": True,
             "noprogress": True,
-            "format": "bestaudio/best",
+            "format": "bestaudio[ext=mp3]/bestaudio[ext=m4a]/bestaudio/best",
             "outtmpl": out_template,
             "noplaylist": True,
-            "postprocessors": [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192",
-                }
-            ],
+            "max_filesize": 50 * 1024 * 1024,
         }
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
@@ -329,14 +368,5 @@ class SoundCloudSource(_YtDlpBase):
         except Exception as exc:  # noqa: BLE001
             logger.warning("[soundcloud] download failed for %s: %s", track.id, exc)
             return None
-        video_id = info.get("id")
-        result = dest_dir / f"{video_id}.mp3"
-        if result.exists():
-            logger.info("[soundcloud] downloaded %s", result.name)
-            return result
-        # yt-dlp may name it differently; grab any fresh mp3 for this id.
-        for candidate in dest_dir.glob(f"{video_id}.*"):
-            if candidate.suffix == ".mp3":
-                return candidate
-        logger.error("[soundcloud] download produced no file for %s", track.id)
-        return None
+        path = self._find_output(info, dest_dir)
+        return _ensure_playable(path) if path else None
