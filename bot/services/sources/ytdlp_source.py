@@ -247,3 +247,90 @@ class YTMusicSource(_YtDlpBase):
                 break
         logger.info("[%s] '%s' -> %d results", self.name, query, len(tracks))
         return tracks
+
+
+class SoundCloudSource(_YtDlpBase):
+    """
+    SoundCloud search + download via yt-dlp (scsearch).
+
+    SoundCloud does NOT block data-center IPs the way YouTube does, so this
+    source works reliably on cloud servers (Render) without cookies. It is the
+    recommended primary source for hosted deployments.
+    """
+
+    name = "soundcloud"
+
+    async def search(self, query: str, limit: int) -> list[Track]:
+        return await asyncio.to_thread(self._search_sync, query, limit)
+
+    def _search_sync(self, query: str, limit: int) -> list[Track]:
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": True,
+            "noplaylist": True,
+            "skip_download": True,
+        }
+        tracks: list[Track] = []
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(f"scsearch{limit}:{query}", download=False)
+        except Exception as exc:  # noqa: BLE001 - let MusicService try next source
+            logger.warning("[soundcloud] search failed: %s", exc)
+            return []
+
+        for entry in (info or {}).get("entries", []) or []:
+            if not entry:
+                continue
+            url = entry.get("url") or entry.get("id", "")
+            title = entry.get("title")
+            if not title or not url:
+                continue
+            tracks.append(
+                Track(
+                    source=self.name,
+                    id=url,
+                    title=title,
+                    artist=entry.get("uploader") or entry.get("channel") or "",
+                    duration=int(entry.get("duration") or 0),
+                    views=int(entry.get("view_count") or 0),
+                )
+            )
+        # SoundCloud search is already relevance-sorted; keep its order.
+        logger.info("[%s] '%s' -> %d results", self.name, query, len(tracks))
+        return tracks
+
+    def _download_sync(self, track: Track, dest_dir: Path) -> Path | None:
+        # SoundCloud needs no cookies / player_client tricks — simple download.
+        out_template = str(dest_dir / "%(id)s.%(ext)s")
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "format": "bestaudio/best",
+            "outtmpl": out_template,
+            "noplaylist": True,
+            "postprocessors": [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }
+            ],
+        }
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(track.id, download=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[soundcloud] download failed for %s: %s", track.id, exc)
+            return None
+        video_id = info.get("id")
+        result = dest_dir / f"{video_id}.mp3"
+        if result.exists():
+            logger.info("[soundcloud] downloaded %s", result.name)
+            return result
+        # yt-dlp may name it differently; grab any fresh mp3 for this id.
+        for candidate in dest_dir.glob(f"{video_id}.*"):
+            if candidate.suffix == ".mp3":
+                return candidate
+        logger.error("[soundcloud] download produced no file for %s", track.id)
+        return None

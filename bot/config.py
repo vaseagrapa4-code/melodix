@@ -29,7 +29,7 @@ class Config:
 
     bot_token: str
     default_language: str = "ru"
-    music_sources: list[str] = field(default_factory=lambda: ["ytmusic", "youtube"])
+    music_sources: list[str] = field(default_factory=lambda: ["soundcloud", "ytmusic", "youtube"])
     max_file_size_mb: int = 49
     max_search_results: int = 24
     page_size: int = 8
@@ -57,7 +57,7 @@ def load_config() -> Config:
             "token you got from @BotFather."
         )
 
-    sources_raw = os.getenv("MUSIC_SOURCES", "ytmusic,youtube")
+    sources_raw = os.getenv("MUSIC_SOURCES", "soundcloud,ytmusic,youtube")
     sources = [s.strip() for s in sources_raw.split(",") if s.strip()]
 
     download_dir = BASE_DIR / os.getenv("DOWNLOAD_DIR", "downloads")

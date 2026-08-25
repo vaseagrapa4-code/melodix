@@ -14,12 +14,13 @@ import logging
 from pathlib import Path
 
 from .sources.base import MusicSource, Track
-from .sources.ytdlp_source import YouTubeSource, YTMusicSource
+from .sources.ytdlp_source import SoundCloudSource, YouTubeSource, YTMusicSource
 
 logger = logging.getLogger(__name__)
 
 # Registry mapping config names -> source classes. Add new sources here.
 _SOURCE_REGISTRY: dict[str, type[MusicSource]] = {
+    "soundcloud": SoundCloudSource,
     "ytmusic": YTMusicSource,
     "youtube": YouTubeSource,
 }
