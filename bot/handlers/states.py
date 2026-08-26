@@ -12,5 +12,8 @@ class CutStates(StatesGroup):
 class PlaylistStates(StatesGroup):
     """Steps of the playlist conversations."""
 
-    waiting_for_name = State()    # creating a playlist: waiting for its name
-    waiting_for_code = State()    # opening a playlist: waiting for its code
+    waiting_for_name = State()        # creating a playlist: waiting for its name
+    waiting_for_code = State()        # opening a playlist: waiting for its code
+    waiting_for_photo = State()       # setting a cover: waiting for a photo
+    choosing_options = State()        # create: choosing private / custom code
+    waiting_for_custom_code = State() # create: typing a custom code

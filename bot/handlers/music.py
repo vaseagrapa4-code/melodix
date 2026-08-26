@@ -56,6 +56,34 @@ async def deliver_track(
 ) -> None:
     """Download `track`, send it as audio, record it, update the counter."""
     status = status_message or await message.answer(translator.get(lang, "downloading"))
+
+    # Fast path: tracks imported from Telegram (forwarded from another bot)
+    # already have a file_id — re-send it instantly, no download needed.
+    if track.source == "telegram":
+        try:
+            await db.add_recent_track(user_id, track.__dict__)
+            await db.increment_downloads(user_id)
+            await message.answer_audio(
+                audio=track.id,  # a Telegram file_id
+                title=track.title or None,
+                performer=track.artist or None,
+                caption=_signature(bot_username),
+                reply_markup=audio_actions_keyboard(
+                    0,
+                    translator.get(lang, "add_to_playlist"),
+                    lyrics_label=translator.get(lang, "btn_lyrics"),
+                    more_artist_label=translator.get(lang, "btn_more_artist"),
+                ),
+            )
+            try:
+                await status.delete()
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Re-send telegram audio failed: %s", exc)
+            await status.edit_text(translator.get(lang, "generic_error"))
+        return
+
     await status.edit_text(translator.get(lang, "downloading"))
 
     try:
@@ -248,9 +276,14 @@ async def on_playlist_add_confirm(
         await callback.answer(translator.get(lang, "generic_error"), show_alert=True)
         return
 
-    ok = await db.add_track_to_playlist(code, track)
-    if not ok:
+    from bot.utils.database import PlaylistError
+
+    status = await db.add_track_to_playlist(code, track)
+    if status == PlaylistError.NOT_FOUND:
         await callback.answer(translator.get(lang, "playlist_not_found"), show_alert=True)
+        return
+    if status == PlaylistError.PLAYLIST_FULL:
+        await callback.answer(translator.get(lang, "playlist_full"), show_alert=True)
         return
 
     pl = await db.get_playlist(code)

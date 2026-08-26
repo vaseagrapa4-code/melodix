@@ -91,11 +91,117 @@ async def on_playlist_name(
     db: Database,
     translator: Translator,
 ) -> None:
+    """Got the name; show creation options (private toggle + custom code)."""
+    from bot.keyboards.inline import playlist_create_options_keyboard
+
     lang = await resolve_language(db, translator, message.from_user.id)
     name = message.text.strip()[:60] or "Playlist"
-    code = await db.create_playlist(message.from_user.id, name)
-    await state.clear()
-    await message.answer(translator.get(lang, "playlist_created", name=name, code=code))
+    await state.update_data(new_name=name, new_private=False, new_code="")
+    await state.set_state(PlaylistStates.choosing_options)
+    await message.answer(
+        translator.get(lang, "playlist_options", name=name),
+        reply_markup=playlist_create_options_keyboard(
+            translator, lang, is_private=False, has_code=False
+        ),
+    )
+
+
+async def _refresh_options(callback, state, translator, lang):
+    """Redraw the options screen from current FSM state."""
+    from bot.keyboards.inline import playlist_create_options_keyboard
+
+    data = await state.get_data()
+    await callback.message.edit_text(
+        translator.get(lang, "playlist_options", name=data.get("new_name", "")),
+        reply_markup=playlist_create_options_keyboard(
+            translator, lang,
+            is_private=data.get("new_private", False),
+            has_code=bool(data.get("new_code")),
+        ),
+    )
+
+
+@router.callback_query(
+    PlaylistStates.choosing_options, F.data.startswith("plopt:")
+)
+async def on_create_options(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db: Database,
+    translator: Translator,
+) -> None:
+    from bot.utils.database import PlaylistError
+
+    lang = await resolve_language(db, translator, callback.from_user.id)
+    action = callback.data.split(":", 1)[1]
+
+    if action == "toggle_private":
+        data = await state.get_data()
+        await state.update_data(new_private=not data.get("new_private", False))
+        await _refresh_options(callback, state, translator, lang)
+        await callback.answer()
+        return
+
+    if action == "set_code":
+        await state.set_state(PlaylistStates.waiting_for_custom_code)
+        await callback.message.answer(translator.get(lang, "playlist_ask_custom_code"))
+        await callback.answer()
+        return
+
+    if action == "create":
+        data = await state.get_data()
+        name = data.get("new_name", "Playlist")
+        owner_name = callback.from_user.full_name or callback.from_user.username or ""
+        status, code = await db.create_playlist(
+            callback.from_user.id, name, owner_name,
+            custom_code=data.get("new_code", ""),
+            is_private=data.get("new_private", False),
+        )
+        await state.clear()
+        if status == PlaylistError.NAME_TAKEN:
+            await callback.message.edit_text(translator.get(lang, "playlist_name_taken", name=name))
+        elif status == PlaylistError.TOO_MANY_PLAYLISTS:
+            await callback.message.edit_text(translator.get(lang, "playlist_too_many"))
+        elif status == PlaylistError.CODE_TAKEN:
+            await callback.message.edit_text(translator.get(lang, "playlist_code_taken"))
+        elif status == PlaylistError.BAD_CODE:
+            await callback.message.edit_text(translator.get(lang, "playlist_code_bad"))
+        else:
+            priv = translator.get(
+                lang, "playlist_created_private" if data.get("new_private") else "playlist_created"
+            )
+            await callback.message.edit_text(priv.format(name=name, code=code))
+        await callback.answer()
+        return
+
+
+@router.message(PlaylistStates.waiting_for_custom_code, F.text)
+async def on_custom_code(
+    message: Message,
+    state: FSMContext,
+    db: Database,
+    translator: Translator,
+) -> None:
+    """Store the typed custom code and return to the options screen."""
+    from bot.keyboards.inline import playlist_create_options_keyboard
+    from bot.utils.database import is_valid_custom_code, normalize_code
+
+    lang = await resolve_language(db, translator, message.from_user.id)
+    code = normalize_code(message.text)
+    if not is_valid_custom_code(code):
+        await message.answer(translator.get(lang, "playlist_code_bad"))
+        return
+    await state.update_data(new_code=code)
+    await state.set_state(PlaylistStates.choosing_options)
+    data = await state.get_data()
+    await message.answer(
+        translator.get(lang, "playlist_options_code", code=code, name=data.get("new_name", "")),
+        reply_markup=playlist_create_options_keyboard(
+            translator, lang,
+            is_private=data.get("new_private", False),
+            has_code=True,
+        ),
+    )
 
 
 @router.message(PlaylistStates.waiting_for_code, F.text)
@@ -108,7 +214,10 @@ async def on_playlist_code(
     lang = await resolve_language(db, translator, message.from_user.id)
     code = message.text.strip().upper()
     await state.clear()
-    await _open_playlist(message, code, lang, db, translator, count_use=True)
+    await _open_playlist(
+        message, code, lang, db, translator,
+        count_use=True, opener_id=message.from_user.id,
+    )
 
 
 @router.callback_query(F.data.startswith("plopen:"))
@@ -120,8 +229,12 @@ async def on_playlist_open(
     lang = await resolve_language(db, translator, callback.from_user.id)
     code = callback.data.split(":", 1)[1]
     # Opening your own playlist from "My playlists" should not inflate the
-    # popularity counter, so count_use=False here.
-    await _open_playlist(callback.message, code, lang, db, translator, count_use=False)
+    # popularity counter, so count_use=False here. Pass opener_id so the
+    # owner can open their own private playlist.
+    await _open_playlist(
+        callback.message, code, lang, db, translator,
+        count_use=False, opener_id=callback.from_user.id,
+    )
     await callback.answer()
 
 
@@ -132,11 +245,17 @@ async def _open_playlist(
     db: Database,
     translator: Translator,
     count_use: bool,
+    opener_id: int = 0,
 ) -> None:
     """Show a playlist's tracks (shared helper for code / button opening)."""
     pl = await db.get_playlist(code)
     if not pl:
         await message.answer(translator.get(lang, "playlist_not_found"))
+        return
+
+    # Private playlists can only be opened by their owner.
+    if pl.get("is_private") and pl.get("owner_id") != opener_id:
+        await message.answer(translator.get(lang, "playlist_is_private"))
         return
 
     tracks = await db.get_playlist_tracks(code)
@@ -145,12 +264,25 @@ async def _open_playlist(
         return
 
     if count_use:
-        await db.increment_playlist_uses(code)
+        # Record this distinct opener for the "people who tried it" metric.
+        await db.increment_playlist_uses(code, user_id=opener_id)
 
-    await message.answer(
-        translator.get(lang, "playlist_opened", name=pl["name"], code=code, count=len(tracks)),
-        reply_markup=playlist_tracks_keyboard(code, tracks),
+    owner = pl.get("owner_name") or translator.get(lang, "playlist_owner_unknown")
+    caption = translator.get(
+        lang, "playlist_opened",
+        name=pl["name"], code=code, count=len(tracks), owner=owner,
     )
+    keyboard = playlist_tracks_keyboard(code, tracks)
+
+    # If the playlist has a small cover photo, send it with the caption.
+    photo_id = pl.get("photo_id")
+    if photo_id:
+        try:
+            await message.answer_photo(photo_id, caption=caption, reply_markup=keyboard)
+            return
+        except Exception:  # noqa: BLE001 - fall back to text if photo id invalid
+            pass
+    await message.answer(caption, reply_markup=keyboard)
 
 
 @router.callback_query(F.data.startswith("plpick:"))
@@ -180,6 +312,60 @@ async def on_playlist_track_pick(
         translator, music, config, db, bot_username=bot_username,
         status_message=status,
     )
+
+
+@router.callback_query(F.data.startswith("plphoto:"))
+async def on_playlist_photo_request(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db: Database,
+    translator: Translator,
+) -> None:
+    """Owner tapped 'Set photo' — ask them to send a photo."""
+    lang = await resolve_language(db, translator, callback.from_user.id)
+    code = callback.data.split(":", 1)[1]
+    pl = await db.get_playlist(code)
+    if not pl or pl["owner_id"] != callback.from_user.id:
+        await callback.answer(translator.get(lang, "generic_error"), show_alert=True)
+        return
+    await state.set_state(PlaylistStates.waiting_for_photo)
+    await state.update_data(photo_code=code)
+    await callback.message.answer(translator.get(lang, "playlist_ask_photo"))
+    await callback.answer()
+
+
+@router.message(PlaylistStates.waiting_for_photo, F.photo)
+async def on_playlist_photo_received(
+    message: Message,
+    state: FSMContext,
+    db: Database,
+    translator: Translator,
+) -> None:
+    """Save the smallest version of the sent photo as the playlist cover."""
+    lang = await resolve_language(db, translator, message.from_user.id)
+    data = await state.get_data()
+    code = data.get("photo_code")
+    await state.clear()
+    if not code:
+        return
+    # message.photo is a list of sizes; take a small one for a thumbnail.
+    photo_id = message.photo[0].file_id
+    ok = await db.set_playlist_photo(code, photo_id, message.from_user.id)
+    if ok:
+        await message.answer(translator.get(lang, "playlist_photo_set"))
+    else:
+        await message.answer(translator.get(lang, "generic_error"))
+
+
+@router.message(PlaylistStates.waiting_for_photo)
+async def on_playlist_photo_wrong(
+    message: Message,
+    db: Database,
+    translator: Translator,
+) -> None:
+    """User sent something that isn't a photo."""
+    lang = await resolve_language(db, translator, message.from_user.id)
+    await message.answer(translator.get(lang, "playlist_ask_photo"))
 
 
 @router.callback_query(F.data.startswith("pldel:"))

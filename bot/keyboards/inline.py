@@ -105,6 +105,30 @@ def playlist_menu_keyboard(translator: Translator, lang: str) -> InlineKeyboardM
     return builder.as_markup()
 
 
+def playlist_create_options_keyboard(
+    translator: Translator, lang: str, is_private: bool, has_code: bool
+) -> InlineKeyboardMarkup:
+    """
+    Options shown while creating a playlist: toggle private, set a custom code,
+    or create it. The private/code state is kept in the FSM.
+    """
+    builder = InlineKeyboardBuilder()
+    # Toggle private/public.
+    priv_label = translator.get(
+        lang, "playlist_opt_private_on" if is_private else "playlist_opt_private_off"
+    )
+    builder.button(text=priv_label, callback_data="plopt:toggle_private")
+    # Set / change custom code.
+    code_label = translator.get(
+        lang, "playlist_opt_code_set" if has_code else "playlist_opt_code"
+    )
+    builder.button(text=code_label, callback_data="plopt:set_code")
+    # Create.
+    builder.button(text=translator.get(lang, "playlist_opt_create"), callback_data="plopt:create")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
 def playlist_target_keyboard(playlists: list[dict], track_index: int) -> InlineKeyboardMarkup:
     """Choose which playlist to add a track to."""
     builder = InlineKeyboardBuilder()
@@ -133,12 +157,13 @@ def playlist_tracks_keyboard(code: str, tracks: list[dict]) -> InlineKeyboardMar
 def playlist_list_keyboard(
     playlists: list[dict], translator: Translator, lang: str
 ) -> InlineKeyboardMarkup:
-    """User's own playlists: open or delete each one."""
+    """User's own playlists: open, set photo, or delete each one."""
     builder = InlineKeyboardBuilder()
     for pl in playlists:
         builder.button(text=f"{pl['name']} ({pl['code']})", callback_data=f"plopen:{pl['code']}")
+        builder.button(text=translator.get(lang, "playlist_photo_btn"), callback_data=f"plphoto:{pl['code']}")
         builder.button(text=translator.get(lang, "playlist_delete_btn"), callback_data=f"pldel:{pl['code']}")
-    builder.adjust(2)  # [open][delete] per row
+    builder.adjust(3)  # [open][photo][delete] per row
     return builder.as_markup()
 
 

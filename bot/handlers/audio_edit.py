@@ -121,7 +121,14 @@ async def receive_times(
     # Download the source track first (it was only kept as metadata).
     track = Track(**track_dict)
     try:
-        src_path = await music.download(track, config.download_dir)
+        if track.source == "telegram":
+            # Imported from Telegram: download by file_id via the bot itself.
+            import time as _t
+            file = await message.bot.get_file(track.id)
+            src_path = config.download_dir / f"tg_{message.from_user.id}_{int(_t.time())}.audio"
+            await message.bot.download_file(file.file_path, destination=src_path)
+        else:
+            src_path = await music.download(track, config.download_dir)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Cut download failed: %s", exc)
         src_path = None

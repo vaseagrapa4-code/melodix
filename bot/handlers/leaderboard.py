@@ -49,8 +49,9 @@ async def on_top_menu(
                 lines.append(
                     translator.get(
                         lang, "top_playlists_item",
-                        rank=i, name=r["name"], uses=r["uses"],
-                        count=r["track_count"], code=r["code"],
+                        rank=i, name=r["name"],
+                        owner=r.get("owner_name") or "?",
+                        people=r["people"], code=r["code"],
                     )
                 )
             await callback.message.edit_text("\n".join(lines))

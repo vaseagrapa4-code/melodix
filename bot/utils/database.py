@@ -26,8 +26,44 @@ logger = logging.getLogger(__name__)
 # How many recent tracks to remember per user (for the /cut picker).
 RECENT_LIMIT = 10
 
+# Playlist limits (protect the free database from abuse).
+MAX_TRACKS_PER_PLAYLIST = 500
+MAX_PLAYLISTS_PER_USER = 50
+
 # Alphabet for share codes (no ambiguous chars like O/0, I/1).
 _CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+# Result codes returned by create_playlist / add_track_to_playlist so handlers
+# can show the right message.
+class PlaylistError:
+    OK = "ok"
+    NAME_TAKEN = "name_taken"
+    TOO_MANY_PLAYLISTS = "too_many_playlists"
+    PLAYLIST_FULL = "playlist_full"
+    NOT_FOUND = "not_found"
+    CODE_TAKEN = "code_taken"       # custom code already used by someone
+    BAD_CODE = "bad_code"          # custom code has invalid characters/length
+    PRIVATE = "private"            # playlist is private, not the owner
+
+
+# Rules for a custom playlist code (e.g. "Music").
+CODE_MIN_LEN = 3
+CODE_MAX_LEN = 20
+_CODE_ALLOWED = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+
+
+def normalize_code(code: str) -> str:
+    """Normalize a code to the canonical form used for storage/lookup."""
+    return (code or "").strip().upper()
+
+
+def is_valid_custom_code(code: str) -> bool:
+    """Check a user-supplied custom code (letters/digits/underscore only)."""
+    c = normalize_code(code)
+    if not (CODE_MIN_LEN <= len(c) <= CODE_MAX_LEN):
+        return False
+    return all(ch in _CODE_ALLOWED for ch in c)
 
 
 def create_database(database_url: str | None, sqlite_path: Path):
@@ -88,7 +124,10 @@ class Database:
                     CREATE TABLE IF NOT EXISTS playlists (
                         code        TEXT PRIMARY KEY,
                         owner_id    INTEGER NOT NULL,
+                        owner_name  TEXT DEFAULT '',
                         name        TEXT NOT NULL,
+                        photo_id    TEXT DEFAULT '',
+                        is_private  INTEGER NOT NULL DEFAULT 0,
                         uses        INTEGER NOT NULL DEFAULT 0,
                         created_at  INTEGER NOT NULL
                     );
@@ -102,6 +141,16 @@ class Database:
                     );
                     CREATE INDEX IF NOT EXISTS idx_pltracks_code
                         ON playlist_tracks(playlist_code);
+
+                    -- Which distinct users have opened/tried each playlist.
+                    -- Used for the "people who tried it" leaderboard metric.
+                    CREATE TABLE IF NOT EXISTS playlist_openers (
+                        playlist_code TEXT NOT NULL,
+                        user_id       INTEGER NOT NULL,
+                        PRIMARY KEY (playlist_code, user_id),
+                        FOREIGN KEY (playlist_code)
+                            REFERENCES playlists(code) ON DELETE CASCADE
+                    );
                     """
                 )
                 conn.commit()
@@ -128,6 +177,18 @@ class Database:
             for column, sql in migrations.items():
                 if column not in cols:
                     logger.info("Migrating DB: adding users.%s", column)
+                    conn.execute(sql)
+
+            # New playlist columns (owner_name, photo_id) for older DBs.
+            pcols = {row["name"] for row in conn.execute("PRAGMA table_info(playlists)")}
+            pmig = {
+                "owner_name": "ALTER TABLE playlists ADD COLUMN owner_name TEXT DEFAULT ''",
+                "photo_id": "ALTER TABLE playlists ADD COLUMN photo_id TEXT DEFAULT ''",
+                "is_private": "ALTER TABLE playlists ADD COLUMN is_private INTEGER NOT NULL DEFAULT 0",
+            }
+            for column, sql in pmig.items():
+                if column not in pcols:
+                    logger.info("Migrating DB: adding playlists.%s", column)
                     conn.execute(sql)
             conn.commit()
 
@@ -263,19 +324,77 @@ class Database:
             if not exists:
                 return code
 
-    async def create_playlist(self, owner_id: int, name: str) -> str:
-        def _create() -> str:
+    async def create_playlist(
+        self, owner_id: int, name: str, owner_name: str = "",
+        custom_code: str = "", is_private: bool = False,
+    ) -> tuple[str, str | None]:
+        """
+        Create a playlist.
+
+        Optional:
+          custom_code -> a chosen code (e.g. "MUSIC"); must be unique globally.
+          is_private  -> if True, only the owner can open it.
+
+        Returns (status, code). status is one of PlaylistError.*:
+          OK, NAME_TAKEN, TOO_MANY_PLAYLISTS, BAD_CODE, CODE_TAKEN
+        """
+        def _create() -> tuple[str, str | None]:
             with self._connect() as conn:
-                code = self._gen_code(conn)
+                # Per-user playlist limit.
+                count = conn.execute(
+                    "SELECT COUNT(*) AS c FROM playlists WHERE owner_id = ?",
+                    (owner_id,),
+                ).fetchone()["c"]
+                if count >= MAX_PLAYLISTS_PER_USER:
+                    return PlaylistError.TOO_MANY_PLAYLISTS, None
+
+                # Name must be unique PER USER (case-insensitive).
+                dupe = conn.execute(
+                    "SELECT 1 FROM playlists WHERE owner_id = ? "
+                    "AND LOWER(name) = LOWER(?)",
+                    (owner_id, name),
+                ).fetchone()
+                if dupe:
+                    return PlaylistError.NAME_TAKEN, None
+
+                # Determine the code: custom (validated + unique) or random.
+                if custom_code:
+                    if not is_valid_custom_code(custom_code):
+                        return PlaylistError.BAD_CODE, None
+                    code = normalize_code(custom_code)
+                    taken = conn.execute(
+                        "SELECT 1 FROM playlists WHERE code = ?", (code,)
+                    ).fetchone()
+                    if taken:
+                        return PlaylistError.CODE_TAKEN, None
+                else:
+                    code = self._gen_code(conn)
+
                 conn.execute(
-                    "INSERT INTO playlists (code, owner_id, name, created_at) "
-                    "VALUES (?, ?, ?, ?)",
-                    (code, owner_id, name, int(time.time())),
+                    "INSERT INTO playlists "
+                    "(code, owner_id, owner_name, name, is_private, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (code, owner_id, owner_name, name,
+                     1 if is_private else 0, int(time.time())),
                 )
                 conn.commit()
-                return code
+                return PlaylistError.OK, code
 
         return await asyncio.to_thread(_create)
+
+    async def set_playlist_photo(self, code: str, photo_id: str, owner_id: int) -> bool:
+        """Set the small cover photo (Telegram file_id) — owner only."""
+        def _set() -> bool:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "UPDATE playlists SET photo_id = ? "
+                    "WHERE code = ? AND owner_id = ?",
+                    (photo_id, code, owner_id),
+                )
+                conn.commit()
+                return cur.rowcount > 0
+
+        return await asyncio.to_thread(_set)
 
     async def get_playlist(self, code: str) -> dict | None:
         def _get() -> dict | None:
@@ -305,21 +424,36 @@ class Database:
 
         return await asyncio.to_thread(_list)
 
-    async def add_track_to_playlist(self, code: str, track: dict) -> bool:
-        def _add() -> bool:
+    async def add_track_to_playlist(self, code: str, track: dict) -> str:
+        """
+        Add a track to a playlist.
+
+        Returns a PlaylistError status:
+          OK            -> added
+          NOT_FOUND     -> no such playlist
+          PLAYLIST_FULL -> reached MAX_TRACKS_PER_PLAYLIST
+        """
+        def _add() -> str:
             with self._connect() as conn:
                 exists = conn.execute(
                     "SELECT 1 FROM playlists WHERE code = ?", (code,)
                 ).fetchone()
                 if not exists:
-                    return False
+                    return PlaylistError.NOT_FOUND
+                count = conn.execute(
+                    "SELECT COUNT(*) AS c FROM playlist_tracks "
+                    "WHERE playlist_code = ?",
+                    (code,),
+                ).fetchone()["c"]
+                if count >= MAX_TRACKS_PER_PLAYLIST:
+                    return PlaylistError.PLAYLIST_FULL
                 conn.execute(
                     "INSERT INTO playlist_tracks (playlist_code, data) "
                     "VALUES (?, ?)",
                     (code, json.dumps(track)),
                 )
                 conn.commit()
-                return True
+                return PlaylistError.OK
 
         return await asyncio.to_thread(_add)
 
@@ -348,30 +482,45 @@ class Database:
 
         return await asyncio.to_thread(_del)
 
-    async def increment_playlist_uses(self, code: str) -> None:
-        """Count when someone opens/uses a shared playlist (popularity)."""
+    async def increment_playlist_uses(self, code: str, user_id: int = 0) -> None:
+        """
+        Record that a playlist was opened/used.
+
+        Increments the total 'uses' counter and, if a user_id is given, records
+        that DISTINCT user as an opener (for the "people who tried it" metric).
+        """
         def _inc() -> None:
             with self._connect() as conn:
                 conn.execute(
                     "UPDATE playlists SET uses = uses + 1 WHERE code = ?",
                     (code,),
                 )
+                if user_id:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO playlist_openers "
+                        "(playlist_code, user_id) VALUES (?, ?)",
+                        (code, user_id),
+                    )
                 conn.commit()
 
         await asyncio.to_thread(_inc)
 
     async def top_playlists(self, limit: int = 10) -> list[dict]:
+        """
+        Most popular playlists, ranked by how many DISTINCT people tried them.
+        """
         def _top() -> list[dict]:
             with self._connect() as conn:
                 rows = conn.execute(
                     """
-                    SELECT p.code, p.name, p.uses,
-                           COUNT(t.id) AS track_count
+                    SELECT p.code, p.name, p.owner_name,
+                           COUNT(DISTINCT o.user_id) AS people
                     FROM playlists p
-                    LEFT JOIN playlist_tracks t ON t.playlist_code = p.code
+                    LEFT JOIN playlist_openers o ON o.playlist_code = p.code
+                    WHERE p.is_private = 0
                     GROUP BY p.code
-                    HAVING track_count > 0
-                    ORDER BY p.uses DESC, track_count DESC
+                    HAVING people > 0
+                    ORDER BY people DESC, p.uses DESC
                     LIMIT ?
                     """,
                     (limit,),
