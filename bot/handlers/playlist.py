@@ -274,14 +274,17 @@ async def _open_playlist(
     )
     keyboard = playlist_tracks_keyboard(code, tracks)
 
-    # If the playlist has a small cover photo, send it with the caption.
+    # If the playlist has a cover photo, send it ABOVE the tracks with the
+    # caption + buttons. Fall back to a plain text message if sending fails.
     photo_id = pl.get("photo_id")
     if photo_id:
         try:
-            await message.answer_photo(photo_id, caption=caption, reply_markup=keyboard)
+            await message.answer_photo(
+                photo=photo_id, caption=caption, reply_markup=keyboard
+            )
             return
-        except Exception:  # noqa: BLE001 - fall back to text if photo id invalid
-            pass
+        except Exception as exc:  # noqa: BLE001 - log why, then fall back
+            logger.warning("Could not send playlist cover for %s: %s", code, exc)
     await message.answer(caption, reply_markup=keyboard)
 
 
@@ -348,10 +351,12 @@ async def on_playlist_photo_received(
     await state.clear()
     if not code:
         return
-    # message.photo is a list of sizes; take a small one for a thumbnail.
-    photo_id = message.photo[0].file_id
+    # message.photo is a list of sizes (smallest -> largest). Use the LARGEST
+    # (last) — its file_id is the most reliable to re-send later.
+    photo_id = message.photo[-1].file_id
     ok = await db.set_playlist_photo(code, photo_id, message.from_user.id)
     if ok:
+        logger.info("Playlist %s photo set (file_id=%s...)", code, photo_id[:15])
         await message.answer(translator.get(lang, "playlist_photo_set"))
     else:
         await message.answer(translator.get(lang, "generic_error"))
